@@ -22,6 +22,7 @@ use ironrdp::connector::credssp::KerberosConfig;
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
+use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
@@ -96,6 +97,7 @@ struct SessionBuilderInner {
     legacy_graphics: bool,
     performance_flags: PerformanceFlags,
     connection_type: ConnectionType,
+    enable_egfx: bool,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -142,6 +144,7 @@ impl Default for SessionBuilderInner {
             legacy_graphics: false,
             performance_flags: PerformanceFlags::default(),
             connection_type: ConnectionType::Lan,
+            enable_egfx: false,
             outbound_message_size_limit: None,
         }
     }
@@ -268,6 +271,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |enable_egfx: bool| { self.0.borrow_mut().enable_egfx = enable_egfx };
             |connection_type: f64| {
                 // MS-RDPBCGR 2.2.1.3.2 connectionType. The server uses it to
                 // pick how conservative to be; claiming Lan on a link that is
@@ -414,6 +418,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             legacy_graphics,
             performance_flags,
             connection_type,
+            enable_egfx,
         );
 
         {
@@ -459,6 +464,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             legacy_graphics = inner.legacy_graphics;
             performance_flags = inner.performance_flags;
             connection_type = inner.connection_type;
+            enable_egfx = inner.enable_egfx;
         }
 
         if pcb.is_some() && vmconnect.is_some() {
@@ -478,6 +484,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         config.performance_flags = performance_flags;
         config.connection_type = connection_type;
+        // Advertising the graphics pipeline is only honest once the channel is
+        // actually registered below; a server told we support it would
+        // otherwise send commands nothing reads.
+        config.support_dyn_vc_gfx_protocol = enable_egfx;
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
@@ -1696,6 +1706,10 @@ async fn connect(
     // In web browser environments, we do not have an easy access to the local address of the socket.
     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
 
+    // Read before the config is moved into the connector, so what is advertised
+    // and what is registered below cannot drift apart.
+    let enable_egfx = config.support_dyn_vc_gfx_protocol;
+
     let mut connector = ClientConnector::new(config, dummy_client_addr);
 
     if let Some(clipboard_backend) = clipboard_backend {
@@ -1716,10 +1730,26 @@ async fn connect(
         );
     }
 
-    if use_display_control {
-        connector.attach_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        );
+    if use_display_control || enable_egfx {
+        let mut drdynvc = DrdynvcClient::new();
+        if use_display_control {
+            drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+        }
+        if enable_egfx {
+            // The compositor in ironrdp-egfx holds the surface pixel state and
+            // the session drains it into the framebuffer, so none of the
+            // per-command notifications are needed here.
+            //
+            // No H.264 decoder: openh264 is a C library and this is wasm32.
+            // Passing None makes the client advertise only the capability sets
+            // it can actually decode, which still covers RFX Progressive and
+            // ClearCodec - both of which beat sending bitmaps.
+            struct EgfxHandler;
+            impl GraphicsPipelineHandler for EgfxHandler {}
+
+            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(EgfxHandler), None));
+        }
+        connector.attach_static_channel(drdynvc);
     }
 
     let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
