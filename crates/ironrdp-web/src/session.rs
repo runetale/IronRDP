@@ -25,6 +25,7 @@ use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
+use ironrdp::pdu::gcc::ConnectionType;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
@@ -94,6 +95,7 @@ struct SessionBuilderInner {
     enable_server_pointer: bool,
     legacy_graphics: bool,
     performance_flags: PerformanceFlags,
+    connection_type: ConnectionType,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -139,6 +141,7 @@ impl Default for SessionBuilderInner {
             enable_server_pointer: true,
             legacy_graphics: false,
             performance_flags: PerformanceFlags::default(),
+            connection_type: ConnectionType::Lan,
             outbound_message_size_limit: None,
         }
     }
@@ -259,6 +262,30 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |connection_type: f64| {
+                // MS-RDPBCGR 2.2.1.3.2 connectionType. The server uses it to
+                // pick how conservative to be; claiming Lan on a link that is
+                // not one asks it to optimise for bandwidth it does not have.
+                #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
+                let value = connection_type as i64;
+                // Matched rather than cast so an unknown number keeps the
+                // default instead of becoming whatever variant happens to sit
+                // at that discriminant.
+                let parsed = match value {
+                    1 => Some(ConnectionType::Modem),
+                    2 => Some(ConnectionType::BroadbandLow),
+                    3 => Some(ConnectionType::Satellite),
+                    4 => Some(ConnectionType::BroadbandHigh),
+                    5 => Some(ConnectionType::Wan),
+                    6 => Some(ConnectionType::Lan),
+                    7 => Some(ConnectionType::Autodetect),
+                    _ => None,
+                };
+                match parsed {
+                    Some(ct) => self.0.borrow_mut().connection_type = ct,
+                    None => warn!(connection_type, "Unknown connection type; keeping the default"),
+                }
+            };
             |performance_flags: f64| {
                 // Raw PerformanceFlags bitfield (MS-RDPBCGR 2.2.1.11.1.1.1). It
                 // arrives as a number because that is all a JS extension value
@@ -380,6 +407,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             outbound_message_size_limit,
             legacy_graphics,
             performance_flags,
+            connection_type,
         );
 
         {
@@ -424,6 +452,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             outbound_message_size_limit = inner.outbound_message_size_limit;
             legacy_graphics = inner.legacy_graphics;
             performance_flags = inner.performance_flags;
+            connection_type = inner.connection_type;
         }
 
         if pcb.is_some() && vmconnect.is_some() {
@@ -442,6 +471,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         );
 
         config.performance_flags = performance_flags;
+        config.connection_type = connection_type;
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
@@ -1505,7 +1535,7 @@ fn build_config(
         keyboard_subtype: 0,
         keyboard_layout: 0, // the server SHOULD use the default active input locale identifier
         keyboard_functional_keys_count: 12,
-        connection_type: ironrdp::pdu::gcc::ConnectionType::Lan,
+        connection_type: ConnectionType::Lan,
         ime_file_name: String::new(),
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize {
