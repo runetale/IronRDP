@@ -39,9 +39,9 @@ use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlCanvasElement;
+use web_sys::{HtmlCanvasElement, OffscreenCanvas};
 
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, RenderTarget};
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
@@ -69,7 +69,7 @@ struct SessionBuilderInner {
     client_name: String,
     desktop_size: DesktopSize,
 
-    render_canvas: Option<HtmlCanvasElement>,
+    render_canvas: Option<RenderTarget>,
     set_cursor_style_callback: Option<js_sys::Function>,
     set_cursor_style_callback_context: Option<JsValue>,
     remote_clipboard_changed_callback: Option<js_sys::Function>,
@@ -203,7 +203,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
     /// Optional
     fn render_canvas(&self, canvas: HtmlCanvasElement) -> Self {
-        self.0.borrow_mut().render_canvas = Some(canvas);
+        self.0.borrow_mut().render_canvas = Some(RenderTarget::Onscreen(canvas));
+        self.clone()
+    }
+
+    /// Optional
+    fn render_offscreen_canvas(&self, canvas: OffscreenCanvas) -> Self {
+        self.0.borrow_mut().render_canvas = Some(RenderTarget::Offscreen(canvas));
         self.clone()
     }
 
@@ -630,7 +636,7 @@ pub(crate) struct Session {
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
 
-    render_canvas: HtmlCanvasElement,
+    render_canvas: RenderTarget,
     set_cursor_style_callback: js_sys::Function,
     set_cursor_style_callback_context: JsValue,
 

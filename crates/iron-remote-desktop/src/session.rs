@@ -1,5 +1,5 @@
 use wasm_bindgen::JsValue;
-use web_sys::{HtmlCanvasElement, js_sys};
+use web_sys::{HtmlCanvasElement, OffscreenCanvas, js_sys};
 
 use crate::clipboard::ClipboardData;
 use crate::error::IronError;
@@ -35,6 +35,13 @@ pub trait SessionBuilder {
 
     #[must_use]
     fn render_canvas(&self, canvas: HtmlCanvasElement) -> Self;
+
+    /// Draw to a canvas transferred to a worker instead of one in the document.
+    ///
+    /// A session on the main thread shares it with paint and with whatever else
+    /// the page is doing; moving both off it is what stops the two competing.
+    #[must_use]
+    fn render_offscreen_canvas(&self, canvas: OffscreenCanvas) -> Self;
 
     #[must_use]
     fn set_cursor_style_callback(&self, callback: js_sys::Function) -> Self;
