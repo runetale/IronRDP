@@ -93,6 +93,7 @@ struct SessionBuilderInner {
     enable_credssp: bool,
     enable_server_pointer: bool,
     legacy_graphics: bool,
+    performance_flags: PerformanceFlags,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -137,6 +138,7 @@ impl Default for SessionBuilderInner {
             enable_credssp: true,
             enable_server_pointer: true,
             legacy_graphics: false,
+            performance_flags: PerformanceFlags::default(),
             outbound_message_size_limit: None,
         }
     }
@@ -257,6 +259,19 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |performance_flags: f64| {
+                // Raw PerformanceFlags bitfield (MS-RDPBCGR 2.2.1.11.1.1.1). It
+                // arrives as a number because that is all a JS extension value
+                // carries; anything out of range keeps the default rather than
+                // truncating into an arbitrary combination.
+                #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                if performance_flags >= 0.0 && performance_flags <= f64::from(u32::MAX) {
+                    self.0.borrow_mut().performance_flags =
+                        PerformanceFlags::from_bits_truncate(performance_flags as u32);
+                } else {
+                    warn!(performance_flags, "Invalid performance flags; keeping the default");
+                }
+            };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -364,6 +379,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             outbound_message_size_limit,
             legacy_graphics,
+            performance_flags,
         );
 
         {
@@ -407,6 +423,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name = inner.printer_driver_name.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
             legacy_graphics = inner.legacy_graphics;
+            performance_flags = inner.performance_flags;
         }
 
         if pcb.is_some() && vmconnect.is_some() {
@@ -423,6 +440,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             desktop_size,
             legacy_graphics,
         );
+
+        config.performance_flags = performance_flags;
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
