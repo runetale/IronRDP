@@ -209,7 +209,14 @@ pub fn decode_upgrade_pass(
 
         let zero_count = zero_counts[band_idx];
         let values = match srl_decoder.as_mut() {
-            Some(decoder) => decoder.decode(zero_count, num_bits)?,
+            Some(decoder) => decoder.decode(zero_count, num_bits).map_err(|_| SrlError::UpgradeBandOverrun {
+                component: 0,
+                band: u8::try_from(band_idx).unwrap_or(u8::MAX),
+                num_bits,
+                zero_count: u16::try_from(zero_count).unwrap_or(u16::MAX),
+                srl_len: u16::try_from(srl_data.len()).unwrap_or(u16::MAX),
+                raw_len: u16::try_from(raw_data.len()).unwrap_or(u16::MAX),
+            })?,
             None => Vec::new(),
         };
         srl_values.push(values);
@@ -983,7 +990,27 @@ impl TileState {
                 self.use_reduce_extrapolate,
                 &mut coefficients[c],
                 &mut sign[c],
-            )?;
+            )
+            .map_err(|err| match err {
+                // The per-band failure knows everything but which of the three
+                // component streams it was reading, which is only known here.
+                SrlError::UpgradeBandOverrun {
+                    band,
+                    num_bits,
+                    zero_count,
+                    srl_len,
+                    raw_len,
+                    ..
+                } => SrlError::UpgradeBandOverrun {
+                    component: u8::try_from(c).unwrap_or(u8::MAX),
+                    band,
+                    num_bits,
+                    zero_count,
+                    srl_len,
+                    raw_len,
+                },
+                other => other,
+            })?;
         }
 
         self.coefficients = coefficients;
@@ -2093,7 +2120,14 @@ mod tests {
                 &mut coefficients,
                 &mut sign,
             ),
-            Err(SrlError::Truncated)
+            Err(SrlError::UpgradeBandOverrun {
+                component: 0,
+                band: 0,
+                num_bits: 4,
+                zero_count: 1,
+                srl_len: 2,
+                raw_len: 0,
+            })
         );
     }
 
@@ -2118,7 +2152,16 @@ mod tests {
                 [ComponentCodecQuant::LOSSLESS; 3],
                 75,
             ),
-            Err(SrlError::Truncated)
+            // A fresh tile's signs are all zero, so HL1 asks for one entry per
+            // coefficient and the first component's two bytes run out at once.
+            Err(SrlError::UpgradeBandOverrun {
+                component: 0,
+                band: 0,
+                num_bits: 4,
+                zero_count: 1024,
+                srl_len: 2,
+                raw_len: 0,
+            })
         );
 
         assert_eq!(tile.coefficients, coefficients);

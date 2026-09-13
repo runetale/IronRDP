@@ -14,6 +14,20 @@ const MAX_ZERO_RUN: usize = 4096;
 pub enum SrlError {
     /// The stream ended before a complete code word was read.
     Truncated,
+    /// A band asked the stream for more entries than it held.
+    ///
+    /// This carries the band's own parameters because the count of entries a
+    /// band requests is derived from decoder state, not from the wire: when it
+    /// disagrees with what the encoder assumed, the stream runs out and the
+    /// only way to see which term is wrong is to report all of them.
+    UpgradeBandOverrun {
+        component: u8,
+        band: u8,
+        num_bits: u8,
+        zero_count: u16,
+        srl_len: u16,
+        raw_len: u16,
+    },
     /// An SRL value requires between one and fifteen magnitude bits.
     InvalidBitCount(u8),
     /// A value cannot be represented by the magnitude width.
@@ -26,6 +40,18 @@ impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Truncated => write!(f, "srl stream is truncated"),
+            Self::UpgradeBandOverrun {
+                component,
+                band,
+                num_bits,
+                zero_count,
+                srl_len,
+                raw_len,
+            } => write!(
+                f,
+                "srl stream ran out in component {component} band {band} \
+                 (num_bits={num_bits} zero_count={zero_count} srl_len={srl_len} raw_len={raw_len})"
+            ),
             Self::InvalidBitCount(bits) => write!(f, "invalid srl magnitude bit count {bits}"),
             Self::MagnitudeOutOfRange { magnitude, max } => {
                 write!(f, "srl magnitude {magnitude} exceeds maximum {max}")
