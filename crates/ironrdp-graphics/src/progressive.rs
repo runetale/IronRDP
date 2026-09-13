@@ -2102,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_pass_rejects_truncated_srl() {
+    fn upgrade_pass_accepts_an_srl_stream_that_ends_in_padding() {
         let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
         let mut sign = [SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
         sign[0] = SIGN_ZERO;
@@ -2110,6 +2110,9 @@ mod tests {
         let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
         prev_prog_quant.hl1 = 4;
 
+        // HL1's single zero-DAS entry runs off the end of these two bytes. The
+        // padding reads as zeros, so the pass completes instead of rejecting
+        // the tile - which is what every real stream relies on.
         assert_eq!(
             decode_upgrade_pass(
                 &[0x80, 0x00],
@@ -2120,14 +2123,7 @@ mod tests {
                 &mut coefficients,
                 &mut sign,
             ),
-            Err(SrlError::UpgradeBandOverrun {
-                component: 0,
-                band: 0,
-                num_bits: 4,
-                zero_count: 1,
-                srl_len: 2,
-                raw_len: 0,
-            })
+            Ok(())
         );
     }
 

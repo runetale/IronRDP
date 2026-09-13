@@ -12,8 +12,6 @@ const MAX_ZERO_RUN: usize = 4096;
 /// Errors encountered while decoding or encoding an SRL stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrlError {
-    /// The stream ended before a complete code word was read.
-    Truncated,
     /// A band asked the stream for more entries than it held.
     ///
     /// This carries the band's own parameters because the count of entries a
@@ -39,7 +37,6 @@ pub enum SrlError {
 impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Truncated => write!(f, "srl stream is truncated"),
             Self::UpgradeBandOverrun {
                 component,
                 band,
@@ -126,8 +123,8 @@ impl<'a> SrlDecoder<'a> {
         loop {
             let k = self.kp / 8;
 
-            if self.reader.read_bit()? {
-                let tail = usize::try_from(self.reader.read_bits(k)?).map_err(|_| SrlError::ZeroRunTooLong)?;
+            if self.reader.read_bit() {
+                let tail = usize::try_from(self.reader.read_bits(k)).map_err(|_| SrlError::ZeroRunTooLong)?;
                 self.kp = self.kp.saturating_sub(6);
 
                 let zeros = zeros.checked_add(tail).ok_or(SrlError::ZeroRunTooLong)?;
@@ -146,11 +143,11 @@ impl<'a> SrlDecoder<'a> {
 
     fn decode_nonzero(&mut self, num_bits: u8) -> Result<i16, SrlError> {
         let maximum = max_magnitude(num_bits)?;
-        let sign = self.reader.read_bit()?;
+        let sign = self.reader.read_bit();
         let mut zero_count = 0u16;
 
         while zero_count + 1 < maximum {
-            if self.reader.read_bit()? {
+            if self.reader.read_bit() {
                 break;
             }
 
@@ -299,27 +296,38 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn read_bit(&mut self) -> Result<bool, SrlError> {
-        let Some(&byte) = self.data.get(self.byte_idx) else {
-            return Err(SrlError::Truncated);
-        };
+    /// Read one bit, treating everything past the end of the stream as zero.
+    ///
+    /// A component's stream is only as long as its last code word needs, and an
+    /// encoder is free to let the trailing entries of a band fall into the
+    /// padding past that. The reference decoder attaches the buffer to a bit
+    /// stream that shifts in zeros once it is exhausted, so those entries come
+    /// out as zeros - no refinement - rather than as a failure. Refusing to
+    /// read past the end instead rejects the whole tile.
+    ///
+    /// Running off the end cannot run away: a caller only ever asks for the
+    /// number of entries its band holds, and a zero run is bounded.
+    fn read_bit(&mut self) -> bool {
+        let bit = self
+            .data
+            .get(self.byte_idx)
+            .is_some_and(|&byte| (byte >> (7 - self.bit_idx)) & 1 != 0);
 
-        let bit = (byte >> (7 - self.bit_idx)) & 1 != 0;
         self.bit_idx += 1;
         if self.bit_idx == 8 {
             self.bit_idx = 0;
             self.byte_idx += 1;
         }
 
-        Ok(bit)
+        bit
     }
 
-    fn read_bits(&mut self, count: u8) -> Result<u32, SrlError> {
+    fn read_bits(&mut self, count: u8) -> u32 {
         let mut value = 0u32;
         for _ in 0..count {
-            value = (value << 1) | u32::from(self.read_bit()?);
+            value = (value << 1) | u32::from(self.read_bit());
         }
-        Ok(value)
+        value
     }
 }
 
@@ -391,8 +399,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_stream() {
-        assert_eq!(decode_srl(&[0x80, 0x00], 1, 4), Err(SrlError::Truncated));
+    fn reads_past_the_end_as_zero_bits() {
+        // Zero run 0, then a positive sign, then a magnitude whose unary run
+        // falls off the end of the stream: the missing bits are zeros, so the
+        // run continues to the maximum the width allows rather than failing.
+        assert_eq!(decode_srl(&[0x80, 0x00], 1, 4), Ok(vec![15]));
     }
 
     #[test]
