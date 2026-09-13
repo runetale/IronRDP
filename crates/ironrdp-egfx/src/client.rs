@@ -864,6 +864,7 @@ impl GraphicsPipelineClient {
             )
             .map_err(|error| {
                 warn!(?error, "rfx progressive decode failed");
+                describe_progressive_stream(&pdu.bitmap_data);
                 pdu_other_err!("rfx progressive decode failed")
             })?;
 
@@ -1184,6 +1185,55 @@ impl DvcProcessor for GraphicsPipelineClient {
 }
 
 impl DvcClientProcessor for GraphicsPipelineClient {}
+
+/// Walks the block headers of a progressive stream and reports the first one
+/// that does not fit.
+///
+/// The decoder's own error says only "truncated", which is the same whatever
+/// went wrong. Against a server whose stream this decoder disagrees with, the
+/// block type and the lengths involved are the entire diagnosis, and they are
+/// otherwise unavailable: ironrdp-pdu has no logging of its own.
+fn describe_progressive_stream(data: &[u8]) {
+    const BLOCK_HEADER_SIZE: usize = 6;
+
+    let mut offset = 0usize;
+    let mut index = 0usize;
+    while data.len() - offset >= BLOCK_HEADER_SIZE {
+        let block_type = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        let block_len = u32::from_le_bytes([
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+        ]) as usize;
+
+        if block_len < BLOCK_HEADER_SIZE {
+            warn!(index, offset, block_type = format!("0x{block_type:04x}"), block_len, "block length below header size");
+            return;
+        }
+        if offset + block_len > data.len() {
+            warn!(
+                index,
+                offset,
+                block_type = format!("0x{block_type:04x}"),
+                block_len,
+                remaining = data.len() - offset,
+                stream_len = data.len(),
+                "block runs past the end of the stream"
+            );
+            return;
+        }
+        offset += block_len;
+        index += 1;
+    }
+
+    warn!(
+        blocks = index,
+        trailing = data.len() - offset,
+        stream_len = data.len(),
+        "stream ended with trailing bytes too short for a block header"
+    );
+}
 
 // ============================================================================
 // Frame Cropping
