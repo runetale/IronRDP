@@ -207,16 +207,8 @@ pub fn decode_upgrade_pass(
             continue;
         }
 
-        let zero_count = zero_counts[band_idx];
         let values = match srl_decoder.as_mut() {
-            Some(decoder) => decoder.decode(zero_count, num_bits).map_err(|_| SrlError::UpgradeBandOverrun {
-                component: 0,
-                band: u8::try_from(band_idx).unwrap_or(u8::MAX),
-                num_bits,
-                zero_count: u16::try_from(zero_count).unwrap_or(u16::MAX),
-                srl_len: u16::try_from(srl_data.len()).unwrap_or(u16::MAX),
-                raw_len: u16::try_from(raw_data.len()).unwrap_or(u16::MAX),
-            })?,
+            Some(decoder) => decoder.decode(zero_counts[band_idx], num_bits)?,
             None => Vec::new(),
         };
         srl_values.push(values);
@@ -990,27 +982,7 @@ impl TileState {
                 self.use_reduce_extrapolate,
                 &mut coefficients[c],
                 &mut sign[c],
-            )
-            .map_err(|err| match err {
-                // The per-band failure knows everything but which of the three
-                // component streams it was reading, which is only known here.
-                SrlError::UpgradeBandOverrun {
-                    band,
-                    num_bits,
-                    zero_count,
-                    srl_len,
-                    raw_len,
-                    ..
-                } => SrlError::UpgradeBandOverrun {
-                    component: u8::try_from(c).unwrap_or(u8::MAX),
-                    band,
-                    num_bits,
-                    zero_count,
-                    srl_len,
-                    raw_len,
-                },
-                other => other,
-            })?;
+            )?;
         }
 
         self.coefficients = coefficients;
@@ -2128,19 +2100,18 @@ mod tests {
     }
 
     #[test]
-    fn tile_upgrade_keeps_all_components_on_srl_error() {
+    fn tile_upgrade_accepts_streams_shorter_than_the_band_they_refine() {
         let mut tile = TileState::new();
         let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
         prev_prog_quant.hl1 = 4;
         tile.prog_quant = [prev_prog_quant; 3];
         tile.pass = 1;
         tile.quality = 50;
-        tile.sign[0][0] = SIGN_ZERO;
-        tile.sign[1][0] = SIGN_ZERO;
 
-        let coefficients = tile.coefficients;
-        let sign = tile.sign;
-
+        // A fresh tile's signs are all zero, so HL1 asks for one SRL entry per
+        // coefficient - far more than two bytes describe. What the streams do
+        // not reach is simply not refined, which is how a server sends a tile
+        // whose upper bands hold nothing worth spending bits on.
         assert_eq!(
             tile.decode_upgrade(
                 [&[0x90, 0x00], &[0x80, 0x00], &[]],
@@ -2148,23 +2119,12 @@ mod tests {
                 [ComponentCodecQuant::LOSSLESS; 3],
                 75,
             ),
-            // A fresh tile's signs are all zero, so HL1 asks for one entry per
-            // coefficient and the first component's two bytes run out at once.
-            Err(SrlError::UpgradeBandOverrun {
-                component: 0,
-                band: 0,
-                num_bits: 4,
-                zero_count: 1024,
-                srl_len: 2,
-                raw_len: 0,
-            })
+            Ok(())
         );
 
-        assert_eq!(tile.coefficients, coefficients);
-        assert_eq!(tile.sign, sign);
-        assert_eq!(tile.prog_quant, [prev_prog_quant; 3]);
-        assert_eq!(tile.pass, 1);
-        assert_eq!(tile.quality, 50);
+        assert_eq!(tile.prog_quant, [ComponentCodecQuant::LOSSLESS; 3]);
+        assert_eq!(tile.pass, 2);
+        assert_eq!(tile.quality, 75);
     }
 
     #[test]

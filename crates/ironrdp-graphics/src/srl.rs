@@ -12,20 +12,6 @@ const MAX_ZERO_RUN: usize = 4096;
 /// Errors encountered while decoding or encoding an SRL stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrlError {
-    /// A band asked the stream for more entries than it held.
-    ///
-    /// This carries the band's own parameters because the count of entries a
-    /// band requests is derived from decoder state, not from the wire: when it
-    /// disagrees with what the encoder assumed, the stream runs out and the
-    /// only way to see which term is wrong is to report all of them.
-    UpgradeBandOverrun {
-        component: u8,
-        band: u8,
-        num_bits: u8,
-        zero_count: u16,
-        srl_len: u16,
-        raw_len: u16,
-    },
     /// An SRL value requires between one and fifteen magnitude bits.
     InvalidBitCount(u8),
     /// A value cannot be represented by the magnitude width.
@@ -37,18 +23,6 @@ pub enum SrlError {
 impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::UpgradeBandOverrun {
-                component,
-                band,
-                num_bits,
-                zero_count,
-                srl_len,
-                raw_len,
-            } => write!(
-                f,
-                "srl stream ran out in component {component} band {band} \
-                 (num_bits={num_bits} zero_count={zero_count} srl_len={srl_len} raw_len={raw_len})"
-            ),
             Self::InvalidBitCount(bits) => write!(f, "invalid srl magnitude bit count {bits}"),
             Self::MagnitudeOutOfRange { magnitude, max } => {
                 write!(f, "srl magnitude {magnitude} exceeds maximum {max}")
@@ -68,7 +42,8 @@ pub struct SrlDecoder<'a> {
     reader: BitReader<'a>,
     kp: u8,
     zero_run_remaining: usize,
-    nonzero_pending: bool,
+    /// Set once the run length has been read and the value it precedes is next.
+    unary_pending: bool,
 }
 
 impl<'a> SrlDecoder<'a> {
@@ -86,7 +61,7 @@ impl<'a> SrlDecoder<'a> {
             reader: BitReader::new(data),
             kp: INITIAL_KP,
             zero_run_remaining: 0,
-            nonzero_pending: false,
+            unary_pending: false,
         }
     }
 
@@ -95,72 +70,69 @@ impl<'a> SrlDecoder<'a> {
     /// The adaptive state and a partially consumed zero run are retained for the
     /// next call, as required when SRL entries span bands.
     pub fn decode(&mut self, num_values: usize, num_bits: u8) -> Result<Vec<i16>, SrlError> {
+        let maximum = max_magnitude(num_bits)?;
         let mut output = Vec::with_capacity(num_values);
 
         while output.len() < num_values {
-            if self.zero_run_remaining != 0 {
-                self.zero_run_remaining -= 1;
-                output.push(0);
-                continue;
-            }
-
-            if self.nonzero_pending {
-                output.push(self.decode_nonzero(num_bits)?);
-                self.nonzero_pending = false;
-                continue;
-            }
-
-            self.zero_run_remaining = self.decode_zero_run()?;
-            self.nonzero_pending = true;
+            output.push(self.decode_one(maximum));
         }
 
         Ok(output)
     }
 
-    fn decode_zero_run(&mut self) -> Result<usize, SrlError> {
-        let mut zeros = 0usize;
+    /// Decode the single next entry.
+    ///
+    /// A zero run is emitted as it is read rather than totalled first: each `0`
+    /// code word stands for `1 << k` zeros and is handed out one at a time, and
+    /// only when those are exhausted is the next code word read. Summing the run
+    /// up front instead has to keep reading until it meets the `1` that ends it,
+    /// and past the end of the stream - where every bit reads as zero - that
+    /// walk never meets one. The run then grows without bound on a stream that
+    /// simply had nothing more to say, and a tile whose last band ran into the
+    /// padding is rejected.
+    fn decode_one(&mut self, maximum: u16) -> i16 {
+        if self.zero_run_remaining != 0 {
+            self.zero_run_remaining -= 1;
+            return 0;
+        }
 
-        loop {
+        if !self.unary_pending {
             let k = self.kp / 8;
 
-            if self.reader.read_bit() {
-                let tail = usize::try_from(self.reader.read_bits(k)).map_err(|_| SrlError::ZeroRunTooLong)?;
-                self.kp = self.kp.saturating_sub(6);
-
-                let zeros = zeros.checked_add(tail).ok_or(SrlError::ZeroRunTooLong)?;
-                return (zeros <= MAX_ZERO_RUN).then_some(zeros).ok_or(SrlError::ZeroRunTooLong);
+            if !self.reader.read_bit() {
+                // The run is at least one chunk long; the rest of it, if any,
+                // is described by the code words that follow this one.
+                self.zero_run_remaining = (1usize << k) - 1;
+                self.kp = self.kp.saturating_add(4).min(MAX_KP);
+                return 0;
             }
 
-            let chunk = 1usize << k;
-            zeros = zeros.checked_add(chunk).ok_or(SrlError::ZeroRunTooLong)?;
-            if zeros > MAX_ZERO_RUN {
-                return Err(SrlError::ZeroRunTooLong);
+            // The run ends within this chunk, and its length is the next k bits.
+            // `k` is at most ten, so the length always fits.
+            self.unary_pending = true;
+            self.zero_run_remaining = usize::try_from(self.reader.read_bits(k)).unwrap_or(0);
+            if self.zero_run_remaining != 0 {
+                self.zero_run_remaining -= 1;
+                return 0;
             }
-
-            self.kp = self.kp.saturating_add(4).min(MAX_KP);
         }
-    }
 
-    fn decode_nonzero(&mut self, num_bits: u8) -> Result<i16, SrlError> {
-        let maximum = max_magnitude(num_bits)?;
+        self.unary_pending = false;
+
         let sign = self.reader.read_bit();
-        let mut zero_count = 0u16;
+        self.kp = self.kp.saturating_sub(6);
 
-        while zero_count + 1 < maximum {
+        let mut magnitude = 1u16;
+        while magnitude < maximum {
             if self.reader.read_bit() {
                 break;
             }
 
-            zero_count += 1;
+            magnitude += 1;
         }
 
-        let magnitude = zero_count + 1;
-        let magnitude = i16::try_from(magnitude).map_err(|_| SrlError::MagnitudeOutOfRange {
-            magnitude,
-            max: maximum,
-        })?;
-
-        Ok(if sign { -magnitude } else { magnitude })
+        let magnitude = i16::try_from(magnitude).unwrap_or(i16::MAX);
+        if sign { -magnitude } else { magnitude }
     }
 }
 
@@ -411,6 +383,14 @@ mod tests {
         // The same payload as the first case, from a server that padded the
         // final code word out to a byte and stopped there.
         assert_eq!(decode_srl(&[0x84], 1, 4), Ok(vec![3]));
+    }
+
+    #[test]
+    fn a_zero_run_reaching_the_end_of_the_stream_keeps_producing_zeros() {
+        // A stream with nothing left to say: every entry the band still wants
+        // is a zero. Totalling the run before emitting any of it would instead
+        // keep reading for a terminator the padding never supplies.
+        assert_eq!(decode_srl(&[], 64, 1), Ok(vec![0; 64]));
     }
 
     #[test]
