@@ -1260,8 +1260,13 @@ fn describe_progressive_stream(data: &[u8]) {
                 + num_quant * 5
                 + num_prog_quant * 16
                 + tiles_data_size;
+            // The flags byte decides which sub-band layout the tile data is in,
+            // and the two layouts put every band at a different offset and
+            // length. A decoder that picks the wrong one reads each band from
+            // the wrong place, which is indistinguishable from a short stream.
             warn!(
                 tile_size = data[h],
+                flags = format!("0x{:02x}", data[h + 5]),
                 num_rects,
                 num_quant,
                 num_prog_quant,
