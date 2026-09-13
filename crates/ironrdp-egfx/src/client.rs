@@ -1233,6 +1233,47 @@ fn describe_progressive_stream(data: &[u8]) {
             block_len,
             "progressive block"
         );
+
+        // A REGION carries its rectangles, both quantisation tables and the
+        // tile data inline, so its body length is the sum of five terms. If
+        // the decoder disagrees with the server about any one of them, every
+        // later read is off - report the arithmetic so the wrong term is
+        // visible rather than inferred.
+        const WBT_REGION: u16 = 0xccc1 + 3;
+        const REGION_HEADER: usize = 12;
+        if block_type == WBT_REGION && block_len >= BLOCK_HEADER_SIZE + REGION_HEADER {
+            let h = offset + BLOCK_HEADER_SIZE;
+            let num_rects = usize::from(u16::from_le_bytes([data[h + 1], data[h + 2]]));
+            let num_quant = usize::from(data[h + 3]);
+            let num_prog_quant = usize::from(data[h + 4]);
+            let num_tiles = usize::from(u16::from_le_bytes([data[h + 6], data[h + 7]]));
+            let tiles_data_size = u32::from_le_bytes([
+                data[h + 8],
+                data[h + 9],
+                data[h + 10],
+                data[h + 11],
+            ]) as usize;
+
+            let body_len = block_len - BLOCK_HEADER_SIZE;
+            let accounted = REGION_HEADER
+                + num_rects * 8
+                + num_quant * 5
+                + num_prog_quant * 16
+                + tiles_data_size;
+            warn!(
+                tile_size = data[h],
+                num_rects,
+                num_quant,
+                num_prog_quant,
+                num_tiles,
+                tiles_data_size,
+                body_len,
+                accounted,
+                over = accounted as i64 - body_len as i64,
+                "region block breakdown"
+            );
+        }
+
         offset += block_len;
         index += 1;
     }
