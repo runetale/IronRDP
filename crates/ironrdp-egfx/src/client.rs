@@ -864,7 +864,6 @@ impl GraphicsPipelineClient {
             )
             .map_err(|error| {
                 warn!(?error, "rfx progressive decode failed");
-                describe_progressive_stream(&pdu.bitmap_data);
                 pdu_other_err!("rfx progressive decode failed")
             })?;
 
@@ -1185,111 +1184,6 @@ impl DvcProcessor for GraphicsPipelineClient {
 }
 
 impl DvcClientProcessor for GraphicsPipelineClient {}
-
-/// Walks the block headers of a progressive stream and reports what it finds.
-///
-/// The decoder's own error says only "truncated", which is the same whatever
-/// went wrong. Against a server whose stream this decoder disagrees with, the
-/// block types and the lengths involved are the entire diagnosis, and they are
-/// otherwise unavailable: ironrdp-pdu has no logging of its own.
-///
-/// Every block is listed, not just an overrunning one: an outer walk that
-/// completes cleanly while the decoder still reports truncation means some
-/// block *body* reads past its own length, and then the question is which.
-fn describe_progressive_stream(data: &[u8]) {
-    const BLOCK_HEADER_SIZE: usize = 6;
-
-    let mut offset = 0usize;
-    let mut index = 0usize;
-    while data.len() - offset >= BLOCK_HEADER_SIZE {
-        let block_type = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        let block_len = u32::from_le_bytes([
-            data[offset + 2],
-            data[offset + 3],
-            data[offset + 4],
-            data[offset + 5],
-        ]) as usize;
-
-        if block_len < BLOCK_HEADER_SIZE {
-            warn!(index, offset, block_type = format!("0x{block_type:04x}"), block_len, "block length below header size");
-            return;
-        }
-        if offset + block_len > data.len() {
-            warn!(
-                index,
-                offset,
-                block_type = format!("0x{block_type:04x}"),
-                block_len,
-                remaining = data.len() - offset,
-                stream_len = data.len(),
-                "block runs past the end of the stream"
-            );
-            return;
-        }
-        warn!(
-            index,
-            offset,
-            block_type = format!("0x{block_type:04x}"),
-            block_len,
-            "progressive block"
-        );
-
-        // A REGION carries its rectangles, both quantisation tables and the
-        // tile data inline, so its body length is the sum of five terms. If
-        // the decoder disagrees with the server about any one of them, every
-        // later read is off - report the arithmetic so the wrong term is
-        // visible rather than inferred.
-        const WBT_REGION: u16 = 0xccc1 + 3;
-        const REGION_HEADER: usize = 12;
-        if block_type == WBT_REGION && block_len >= BLOCK_HEADER_SIZE + REGION_HEADER {
-            let h = offset + BLOCK_HEADER_SIZE;
-            let num_rects = usize::from(u16::from_le_bytes([data[h + 1], data[h + 2]]));
-            let num_quant = usize::from(data[h + 3]);
-            let num_prog_quant = usize::from(data[h + 4]);
-            let num_tiles = usize::from(u16::from_le_bytes([data[h + 6], data[h + 7]]));
-            let tiles_data_size = u32::from_le_bytes([
-                data[h + 8],
-                data[h + 9],
-                data[h + 10],
-                data[h + 11],
-            ]) as usize;
-
-            let body_len = block_len - BLOCK_HEADER_SIZE;
-            let accounted = REGION_HEADER
-                + num_rects * 8
-                + num_quant * 5
-                + num_prog_quant * 16
-                + tiles_data_size;
-            // The flags byte decides which sub-band layout the tile data is in,
-            // and the two layouts put every band at a different offset and
-            // length. A decoder that picks the wrong one reads each band from
-            // the wrong place, which is indistinguishable from a short stream.
-            warn!(
-                tile_size = data[h],
-                flags = format!("0x{:02x}", data[h + 5]),
-                num_rects,
-                num_quant,
-                num_prog_quant,
-                num_tiles,
-                tiles_data_size,
-                body_len,
-                accounted,
-                over = accounted as i64 - body_len as i64,
-                "region block breakdown"
-            );
-        }
-
-        offset += block_len;
-        index += 1;
-    }
-
-    warn!(
-        blocks = index,
-        trailing = data.len() - offset,
-        stream_len = data.len(),
-        "stream ended with trailing bytes too short for a block header"
-    );
-}
 
 // ============================================================================
 // Frame Cropping
