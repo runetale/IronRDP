@@ -1186,13 +1186,16 @@ impl DvcProcessor for GraphicsPipelineClient {
 
 impl DvcClientProcessor for GraphicsPipelineClient {}
 
-/// Walks the block headers of a progressive stream and reports the first one
-/// that does not fit.
+/// Walks the block headers of a progressive stream and reports what it finds.
 ///
 /// The decoder's own error says only "truncated", which is the same whatever
 /// went wrong. Against a server whose stream this decoder disagrees with, the
-/// block type and the lengths involved are the entire diagnosis, and they are
+/// block types and the lengths involved are the entire diagnosis, and they are
 /// otherwise unavailable: ironrdp-pdu has no logging of its own.
+///
+/// Every block is listed, not just an overrunning one: an outer walk that
+/// completes cleanly while the decoder still reports truncation means some
+/// block *body* reads past its own length, and then the question is which.
 fn describe_progressive_stream(data: &[u8]) {
     const BLOCK_HEADER_SIZE: usize = 6;
 
@@ -1223,6 +1226,13 @@ fn describe_progressive_stream(data: &[u8]) {
             );
             return;
         }
+        warn!(
+            index,
+            offset,
+            block_type = format!("0x{block_type:04x}"),
+            block_len,
+            "progressive block"
+        );
         offset += block_len;
         index += 1;
     }
